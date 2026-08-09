@@ -40,8 +40,9 @@ from typing import TYPE_CHECKING, Dict, Optional, Set, Tuple
 
 import spack.builder
 import spack.config
-import spack.util.filesystem as fs
-import spack.util.tty as tty
+import spack.util.path
+import spack.llnl.util.filesystem as fs
+import spack.llnl.util.tty as tty
 
 if TYPE_CHECKING:
     import spack.package_base
@@ -57,7 +58,7 @@ def debug_source_root() -> str:
     Deliberately outside any install prefix or build cache -- content here
     never affects the dag_hash and never ships in a binary-cache tarball."""
     root = spack.config.get("config:debug_source_root", "$user_cache_path/debug-sources")
-    return spack.config.canonicalize_path(root)
+    return spack.util.path.canonicalize_path(root)
 
 
 def debug_source_dir(spec) -> str:
