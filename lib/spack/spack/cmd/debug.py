@@ -38,6 +38,16 @@ def setup_parser(subparser: argparse.ArgumentParser) -> None:
         "--force", action="store_true", help="re-stage even if already staged"
     )
 
+    split_symbols_parser = sp.add_parser(
+        "split-symbols",
+        help="split debug symbols for an installed package into the debug-source cache "
+        "(fallback for packages installed without 'spack install --debug-symbols')",
+    )
+    split_symbols_parser.add_argument("spec", help="installed spec to split symbols for")
+    split_symbols_parser.add_argument(
+        "--force", action="store_true", help="re-split even if already split"
+    )
+
 
 def _format_repo_info(source, commit):
     if source.endswith(".git"):
@@ -113,8 +123,21 @@ def stage_source(args):
     spack.debug_source.stage_source(pkg, force=args.force)
 
 
+def split_symbols(args):
+    specs = spack.cmd.parse_specs(args.spec, concretize=False)
+    if len(specs) != 1:
+        tty.die("'spack debug split-symbols' requires exactly one spec")
+
+    env = ev.active_environment()
+    spec = spack.cmd.disambiguate_spec(specs[0], env)
+    pkg = spec.package
+    spack.debug_source.split_symbols(pkg, force=args.force)
+
+    
 def debug(parser, args):
     if args.debug_command == "report":
         report(args)
     elif args.debug_command == "stage-source":
         stage_source(args)
+    elif args.debug_command == "split-symbols":
+        split_symbols(args)
