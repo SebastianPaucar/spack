@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Dict, Optional, Set, Tuple
 
 import spack.builder
 import spack.config
+from spack.stage import StageComposite
 import spack.util.path
 import spack.llnl.util.filesystem as fs
 import spack.llnl.util.tty as tty
@@ -302,12 +303,13 @@ def stage_source(pkg, *, force: bool = False) -> str:
         fs.remove_directory_contents(src_dest)
 
     fs.mkdirp(dest_root)
-    if not pkg.stage.created:
-        pkg.stage.create()
-    if not pkg.stage.expanded and not pkg.stage.archive_file:
-        pkg.stage.fetch()
-        pkg.stage.check()  # steal_source's internal fetch() skips this; do it explicitly
-    pkg.stage.steal_source(src_dest)
+    stage = pkg.stage[0] if isinstance(pkg.stage, StageComposite) else pkg.stage
+    if not stage.created:
+        stage.create()
+    if not stage.expanded and not stage.archive_file:
+        stage.fetch()
+        stage.check()  # steal_source's internal fetch() skips this; do it explicitly
+    stage.steal_source(src_dest)
     tty.msg(f"Staged source for {pkg.name} at {src_dest}")
 
     tty.warn(
