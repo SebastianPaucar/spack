@@ -31,16 +31,22 @@ captured file is placed at <dest_root>/<composed path with the leading
 "./build") and hdf5 (comp_dir "./build/src", producing a doubled
 "src/src/H5.c" layout) -- see _dest_rel_for_dwarf_pair().
 """
-
+import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
-from typing import TYPE_CHECKING, Dict, Optional, Set, Tuple
+import tarfile
+import tempfile
+from typing import TYPE_CHECKING, Dict, Optional, Set, Tuple, List
 
+import spack.binary_distribution
 import spack.builder
 import spack.config
 from spack.stage import StageComposite
+import spack.oci.image as oci_image
+import spack.oci.oci as oci
 import spack.util.path
 import spack.llnl.util.filesystem as fs
 import spack.llnl.util.tty as tty
@@ -393,6 +399,7 @@ def write_gdbinit(
 
         if have_source:
             f.write(f"set substitute-path ./build {dest_root}\n")
+            f.write(f"set substitute-path . {dest_root}\n")
         else:
             f.write(
                 "# No source captured yet for this spec -- run "
@@ -413,8 +420,22 @@ def write_gdbinit(
             example_bin, example_debug = sorted(split_debug_files.items())[0]
             f.write(f'#   add-symbol-file "{example_debug}" <load-address>   # for {example_bin}\n')
             f.write("#   (get <load-address> from `info sharedlibrary` after `run`)\n")
+
+        f.write("#\n")
+        f.write("# Usage: gdb -x <this file> -ex run --args <your-binary> [args...]\n")
+        f.write("#    or: gdb -x <this file> -ex 'file <your-binary>'\n")
+        f.write("# A bare positional binary argument (gdb -x <this file> <binary>) can\n")
+        f.write("# trigger GDB's debuginfo lookup before this script's settings apply --\n")
+        f.write("# use --args/-ex run or -ex file instead.\n")
+        f.write("#\n")
+        f.write("# Note: 'list <file>:N' may report 'no such file' if GDB recorded the\n")
+        f.write("# name with a leading './' -- try 'list ./<file>:N' if that happens.\n")
+        f.write("# This does not affect breakpoints, backtraces, or normal debugging,\n")
+        f.write("# which resolve source via internal DWARF references, not typed names.\n")
+    
     tty.msg(f"Wrote GDB command file: {gdbinit_path}")
-    tty.msg(f"Use with: gdb -x {gdbinit_path} <your-binary>")
+    tty.msg(f"Use with: gdb -x {gdbinit_path} -ex run --args <your-binary> [args...]")
+    tty.msg(f"Or: gdb -x {gdbinit_path} -ex 'file <your-binary>'")
     return gdbinit_path
 
 
@@ -683,3 +704,208 @@ def split_debug_symbols(pkg: "spack.package_base.PackageBase") -> Tuple[Dict[str
         tty.debug(f"[debuggable] {pkg_id}: no ELF binaries with debug sections were split")
 
     return split_debug_files, total_before - total_after
+
+
+def _iter_split_binaries(dest_root: str):
+    """Yield (build_id, debug_file_path) for every split symbol file
+    found under dest_root/symbols/.build-id/xx/yyyy.debug."""
+    build_id_dir = os.path.join(dest_root, "symbols", ".build-id")
+    if not os.path.isdir(build_id_dir):
+        return
+    for prefix in sorted(os.listdir(build_id_dir)):
+        prefix_path = os.path.join(build_id_dir, prefix)
+        if not os.path.isdir(prefix_path):
+            continue
+        for entry in sorted(os.listdir(prefix_path)):
+            if entry.endswith(".debug"):
+                build_id = prefix + entry[: -len(".debug")]
+                yield build_id, os.path.realpath(os.path.join(prefix_path, entry))
+
+
+def package_source_tarball(dest_root: str, staging_dir: str) -> Optional[str]:
+    """Tar the full captured source tree (everything under dest_root except
+    symbols/ and gdbinit) into a single blob-ready file. One tarball per
+    package, not per build-id -- a package's multiple binaries typically
+    share the same source tree (see hdf5's c++/src, fortran/src, java/src,
+    tools/lib, etc., all captured under one dest_root), so tarring once
+    and referencing it from every build-id's manifest avoids N redundant
+    uploads of the same content."""
+    if not _dest_root_has_source(dest_root):
+        return None
+    tar_path = os.path.join(staging_dir, "source.tar.gz")
+    with tarfile.open(tar_path, "w:gz") as tf:
+        for entry in sorted(os.listdir(dest_root)):
+            if entry in ("symbols", "gdbinit"):
+                continue
+            tf.add(os.path.join(dest_root, entry), arcname=entry)
+    return tar_path
+
+
+def push_debug_artifacts(
+    pkg, target_image: "spack.oci.image.ImageReference", *, push_source: bool, push_symbols: bool
+) -> None:
+    """Push split debug symbols and/or captured source to an OCI mirror,
+    keyed by build-id (not dag_hash), since a future debuginfod-compatible
+    adapter resolves /buildid/<BUILDID>/{debuginfo,source} requests purely
+    by build-id -- see docs/debuginfod.md.
+
+    One shared source tarball is pushed per package (not per build-id),
+    since a package's binaries typically share one source tree; each
+    build-id's manifest references that same blob by digest, so OCI's
+    content-addressing stores it once regardless of how many build-ids
+    reference it.
+    """
+
+    dest_root = debug_source_dir(pkg.spec)
+    pre = f"{pkg.spec.name}:"
+
+    build_ids = list(_iter_split_binaries(dest_root)) if push_symbols else []
+    if push_symbols and not build_ids:
+        tty.warn(f"{pre} no split debug symbols found to push")
+
+    with tempfile.TemporaryDirectory(prefix="spack-debug-push-") as staging:
+        source_tarball = None
+        source_digest = None
+        if push_source:
+            source_tarball = package_source_tarball(dest_root, staging)
+            if source_tarball is None:
+                tty.warn(f"{pre} no captured source found to push")
+            else:
+                with open(source_tarball, "rb") as f:
+                    source_digest = oci_image.Digest.from_sha256(
+                        hashlib.sha256(f.read()).hexdigest()
+                    )
+                oci.upload_blob_with_retry(target_image, file=source_tarball, digest=source_digest)
+
+        if not build_ids and not source_digest:
+            return  # nothing to push
+
+        for build_id, debug_path in build_ids:
+            with open(debug_path, "rb") as f:
+                debug_digest = oci_image.Digest.from_sha256(hashlib.sha256(f.read()).hexdigest())
+            oci.upload_blob_with_retry(target_image, file=debug_path, digest=debug_digest)
+
+            config = oci_image.default_config(
+                architecture=spack.binary_distribution._oci_archspec_to_gooarch(pkg.spec),
+                os="linux",
+            )
+            config_bytes = json.dumps(config, separators=(",", ":")).encode()
+            config_digest = oci_image.Digest.from_sha256(hashlib.sha256(config_bytes).hexdigest())
+            config_path = os.path.join(staging, f"{build_id}.config.json")
+            with open(config_path, "wb") as f:
+                f.write(config_bytes)
+            oci.upload_blob_with_retry(target_image, file=config_path, digest=config_digest)
+
+            manifest = oci_image.default_manifest()
+            manifest["config"] = {
+                "mediaType": manifest["config"]["mediaType"],
+                "digest": str(config_digest),
+                "size": len(config_bytes),
+            }
+            manifest["layers"] = [
+                {
+                    "mediaType": "application/x-elf-debug",
+                    "digest": str(debug_digest),
+                    "size": os.path.getsize(debug_path),
+                }
+            ]
+            if source_digest:
+                manifest["layers"].append(
+                    {
+                        "mediaType": "application/x-tar+gzip",
+                        "digest": str(source_digest),
+                        "size": os.path.getsize(source_tarball),
+                    }
+                )
+            manifest["annotations"] = {
+                "build-id": build_id,
+                "spack.pkg": pkg.spec.name,
+                "spack.dag_hash": pkg.spec.dag_hash(),
+            }
+
+            debug_tag = oci_image.ensure_valid_tag(f"debuginfo-{build_id}")
+            debug_ref = target_image.with_tag(debug_tag)
+            oci.upload_manifest_with_retry(debug_ref, manifest)
+            tty.msg(f"{pre} pushed debuginfo for build-id {build_id} as {debug_ref}")
+
+def fetch_debug_artifacts(spec, *, build_id: Optional[str] = None,
+                           mirror: Optional["spack.mirrors.mirror.Mirror"] = None) -> str:
+    """Fetch previously-pushed debug source/symbols for spec from a
+    configured OCI mirror (or all configured OCI mirrors in order),
+    unpacking into the same debug_source_dir(spec) layout local capture
+    produces -- so gdbinit/substitute-path/debug-file-directory work
+    identically regardless of whether the cache was captured locally
+    or fetched.
+
+    If build_id is given, only that build-id is fetched. Otherwise,
+    every build-id found on spec's installed ELF binaries is fetched."""
+
+    mirrors = [mirror] if mirror else [
+        m for m in spack.mirrors.mirror.MirrorCollection(binary=True).values()
+        if oci_image.is_oci_url(m.fetch_url)
+    ]
+    if not mirrors:
+        tty.die("No OCI mirrors configured to fetch debug artifacts from")
+
+    build_ids = [build_id] if build_id else _build_ids_from_installed_binaries(spec)
+    if not build_ids:
+        tty.warn(f"{spec.name}: no build-ids found on installed binaries")
+        return debug_source_dir(spec)
+
+    dest_root = debug_source_dir(spec)
+    fs.mkdirp(dest_root)
+    fetched_any_source = False
+    split_debug_files: Dict[str, str] = {}
+
+    for bid in build_ids:
+        for m in mirrors:
+            target_image = oci.image_from_mirror(m)
+            debug_ref = target_image.with_tag(oci_image.ensure_valid_tag(f"debuginfo-{bid}"))
+            try:
+                manifest, _ = oci.get_manifest_and_config_with_retry(debug_ref)
+            except Exception:
+                continue  # not on this mirror, try the next
+
+            for layer in manifest["layers"]:
+                digest = oci_image.Digest.from_string(layer["digest"])
+                with oci.make_stage(debug_ref.blob_url(digest), digest, keep=True) as stage:
+                    stage.fetch()
+                    stage.check()
+                    stage.cache_local()
+
+                    if layer["mediaType"] == "application/x-elf-debug":
+                        symbols_dir = os.path.join(dest_root, "symbols")
+                        fs.mkdirp(symbols_dir)
+                        debug_dest = os.path.join(symbols_dir, f"{bid}.debug")
+                        shutil.copy(stage.save_filename, debug_dest)
+                        split_debug_files[bid] = debug_dest
+                        _write_build_id_link(symbols_dir, bid, debug_dest)
+                    elif layer["mediaType"] == "application/x-tar+gzip":
+                        with tarfile.open(stage.save_filename, "r:gz") as tf:
+                            tf.extractall(dest_root)
+                        fetched_any_source = True
+            tty.msg(f"{spec.name}: fetched debuginfo for build-id {bid} from {m.name}")
+            break  # found on this mirror, stop trying others for this build-id
+        else:
+            tty.warn(f"{spec.name}: build-id {bid} not found on any configured OCI mirror")
+
+    if split_debug_files or fetched_any_source:
+        write_gdbinit(spec, dest_root, split_debug_files or None)
+    return dest_root
+
+
+def _build_ids_from_installed_binaries(spec) -> List[str]:
+    """Extract build-ids from every ELF binary in spec's install prefix,
+    by reading .note.gnu.build-id directly -- does not require any local
+    debug-source cache to already exist."""
+    prefix = str(spec.prefix)
+    build_ids = []
+    for root, _, files in os.walk(prefix):
+        for filename in files:
+            filepath = os.path.join(root, filename)
+            if os.path.islink(filepath):
+                continue
+            bid = _get_build_id(filepath)
+            if bid:
+                build_ids.append(bid)
+    return build_ids

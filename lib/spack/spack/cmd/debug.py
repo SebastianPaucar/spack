@@ -48,7 +48,15 @@ def setup_parser(subparser: argparse.ArgumentParser) -> None:
         "--force", action="store_true", help="re-split even if already split"
     )
 
-
+    fetch_parser = sp.add_parser(
+        "fetch",
+        help="fetch previously-pushed debug source/symbols for an installed spec "
+        "from configured OCI mirrors",
+    )
+    fetch_parser.add_argument("spec", nargs="?", help="installed spec to fetch debug info for")
+    fetch_parser.add_argument("--build-id", help="fetch a single specific build-id instead")
+    fetch_parser.add_argument("--mirror", help="mirror name to fetch from (default: all configured OCI mirrors)")
+    
 def _format_repo_info(source, commit):
     if source.endswith(".git"):
         return f"{source[:-4]}/commit/{commit}"
@@ -133,6 +141,29 @@ def split_symbols(args):
     pkg = spec.package
     spack.debug_source.split_symbols(pkg, force=args.force)
 
+def fetch(args):
+    if not args.spec and not args.build_id:
+        tty.die("'spack debug fetch' requires a spec or --build-id")
+
+    mirror = None
+    if args.mirror:
+        mirror = spack.mirrors.mirror.MirrorCollection(binary=True).get(args.mirror)
+        if mirror is None:
+            tty.die(f"No configured mirror named '{args.mirror}'")
+
+    if args.build_id and not args.spec:
+        tty.die("--build-id alone (without a spec) is not yet supported -- "
+                 "spack.debug_source.debug_source_dir() needs a Spec to key the cache")
+        # (a build-id-only fetch would need a different, unkeyed destination --
+        #  worth a separate design decision if this case matters in practice)
+
+    specs = spack.cmd.parse_specs(args.spec, concretize=False)
+    if len(specs) != 1:
+        tty.die("'spack debug fetch' requires exactly one spec")
+    env = ev.active_environment()
+    spec = spack.cmd.disambiguate_spec(specs[0], env)
+
+    spack.debug_source.fetch_debug_artifacts(spec, build_id=args.build_id, mirror=mirror)
     
 def debug(parser, args):
     if args.debug_command == "report":
@@ -141,3 +172,5 @@ def debug(parser, args):
         stage_source(args)
     elif args.debug_command == "split-symbols":
         split_symbols(args)
+    elif args.debug_command == "fetch":
+        fetch(args)
