@@ -45,8 +45,12 @@ def post_install(spec, explicit):
         # no separate manual push step is needed anywhere (e.g. in the Dockerfile).
         if spack.oci.image.is_oci_url(mirror.push_url):
             dest_root = spack.debug_source.debug_source_dir(spec)
+            tty.debug(f"{spec.name}: checking for debug artifacts at {dest_root}")
             if os.path.isdir(dest_root):
                 target_image = spack.oci.oci.image_from_mirror(mirror)
+                tty.debug(f"{spec.name}: found debug-source cache, pushing to '{mirror.name}'")
                 spack.debug_source.push_debug_artifacts(
                     pkg, target_image, push_source=True, push_symbols=True
                 )
+            else:
+                tty.debug(f"{spec.name}: no debug-source cache found, skipping debug push")
